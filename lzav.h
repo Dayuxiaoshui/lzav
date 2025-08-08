@@ -42,6 +42,25 @@
 #define LZAV_API_VER 0x109 ///< API version, unrelated to source code version.
 #define LZAV_VER_STR "4.22" ///< LZAV source code version string.
 
+#ifdef __riscv_vector
+#include <riscv_vector.h>
+#define LZAV_USE_RVV
+#ifdef LZAV_USE_RVV
+#define LZAV_VLEN_MAX __riscv_vsetvlmax_e8m1()  // 最大向量长度 (e.g., 16 for VLEN=128)
+#define LZAV_VSETVL(len) __riscv_vsetvl_e8m1(len)  // 动态设置 VL
+#define LZAV_VLOAD8(ptr, vl) __riscv_vle8_v_u8m1(ptr, vl)  // 加载 u8 向量
+#define LZAV_VSTORE8(ptr, vec, vl) __riscv_vse8_v_u8m1(ptr, vec, vl)  // 存储 u8 向量
+#define LZAV_VNEQ(va, vb, vl) __riscv_vmsne_vv_u8m1_b8(va, vb, vl)  // 不等掩码
+#define LZAV_VFIRST(mask, vl) __riscv_vfirst_m_b8(mask, vl)  // 第一个 true 位置
+#define LZAV_VMV_X_U32(vec) __riscv_vmv_x_s_u32m1_u32(vec)  // 提取 scalar
+#define LZAV_VSLIDEDOWN(vec, off, vl) __riscv_vslidedown_vx_u32m1(vec, off, vl)  // 滑动
+#else
+// 无 RVV 时，这些宏无效或回退，但实际函数会用标量
+#define LZAV_VLEN_MAX 1  // 虚拟标量
+#endif
+
+#endif
+
 /**
  * @def LZAV_FMT_MIN
  * @brief Minimal stream format id supported by the decompressor. A value of 2
@@ -449,6 +468,25 @@ enum LZAV_PARAM
 LZAV_INLINE_F size_t lzav_match_len( const uint8_t* const p1,
 	const uint8_t* const p2, const size_t ml, size_t o ) LZAV_NOEX
 {
+#ifdef LZAV_USE_RVV
+    size_t len = o;
+    size_t vlmax = LZAV_VLEN_MAX;
+    while (len + vlmax <= ml) {
+        size_t vl = LZAV_VSETVL(vlmax);
+        vuint8m1_t va = LZAV_VLOAD8(p1 + len, vl);
+        vuint8m1_t vb = LZAV_VLOAD8(p2 + len, vl);
+        vbool8_t mask = LZAV_VNEQ(va, vb, vl);
+        int first = LZAV_VFIRST(mask, vl);
+        if (first >= 0) {
+            return len + (size_t)first;
+        }
+        len += vl;
+    }
+    // 剩余小块退化到标量循环
+    while (len < ml && p1[len] == p2[len]) len++;
+    return len > ml ? ml : len;  // 边界保护
+#else
+    // 原标量代码，保持不变
 #if defined( LZAV_ARCH64 )
 
 	size_t o2 = o + 7;
@@ -581,7 +619,9 @@ LZAV_INLINE_F size_t lzav_match_len( const uint8_t* const p1,
 	}
 
 	return( ml );
+#endif
 }
+
 
 /**
  * @brief Data match length finding function, reverse direction.
@@ -592,52 +632,64 @@ LZAV_INLINE_F size_t lzav_match_len( const uint8_t* const p1,
  * @return The number of matching prior bytes, not including origin position.
  */
 
-LZAV_INLINE_F size_t lzav_match_len_r( const uint8_t* p1, const uint8_t* p2,
-	const size_t ml ) LZAV_NOEX
-{
-	if LZAV_UNLIKELY( ml == 0 )
-	{
-		return( 0 );
-	}
+LZAV_INLINE_F size_t lzav_match_len_r(const uint8_t* p1, const uint8_t* p2, const size_t ml) LZAV_NOEX {
+    if (ml == 0) return 0;
+    if (p1[-1] != p2[-1]) return 0;
 
-	if( p1[ -1 ] != p2[ -1 ])
-	{
-		return( 0 );
-	}
-
-	if LZAV_UNLIKELY( ml != 1 )
-	{
-		const uint8_t* const p1s = p1;
-		const uint8_t* const p1e = p1 - ml + 1;
-		p1--;
-		p2--;
-
-		while LZAV_UNLIKELY( p1 > p1e )
-		{
-			uint16_t v1, v2;
-			memcpy( &v1, p1 - 2, 2 );
-			memcpy( &v2, p2 - 2, 2 );
-
-			const uint32_t vd = (uint32_t) ( v1 ^ v2 );
-
-			if( vd != 0 )
-			{
-				return( (size_t) ( p1s - p1 +
-					( LZAV_COND_EC( vd & 0xFF00, vd & 0x00FF ) == 0 )));
-			}
-
-			p1 -= 2;
-			p2 -= 2;
-		}
-
-		if( p1 + 1 > p1e && p1[ -1 ] != p2[ -1 ])
-		{
-			return( (size_t) ( p1s - p1 ));
-		}
-	}
-
-	return( ml );
+#ifdef LZAV_USE_RVV
+    // RVV (RISC-V Vector) optimized version
+    size_t len = 1;
+    size_t vlmax = LZAV_VLEN_MAX;
+    p1 -= 1;
+    p2 -= 1;
+    while (len + vlmax <= ml) {
+        size_t vl = LZAV_VSETVL(vlmax);
+        vuint8m1_t va = LZAV_VLOAD8(p1 - vl + 1, vl);
+        vuint8m1_t vb = LZAV_VLOAD8(p2 - vl + 1, vl);
+        vbool8_t mask = LZAV_VNEQ(va, vb, vl);
+        // Simulate vlast: invert mask and use vfirst
+        vbool8_t rev_mask = __riscv_vnot_m_b8(mask, vl);
+        int first_eq = LZAV_VFIRST(rev_mask, vl);
+        if (first_eq >= 0) {
+            return len + (vl - first_eq - 1);  // Adjust match length
+        }
+        len += vl;
+        p1 -= vl;
+        p2 -= vl;
+    }
+    // Scalar fallback for remaining bytes
+    while (len < ml && p1[-1] == p2[-1]) {
+        len++;
+        p1--;
+        p2--;
+    }
+    return len;
+#else
+    // Scalar version
+    if LZAV_UNLIKELY(ml != 1) {
+        const uint8_t* const p1s = p1;
+        const uint8_t* const p1e = p1 - ml + 1;
+        p1--;
+        p2--;
+        while LZAV_UNLIKELY(p1 > p1e) {
+            uint16_t v1, v2;
+            memcpy(&v1, p1 - 2, 2);
+            memcpy(&v2, p2 - 2, 2);
+            const uint32_t vd = (uint32_t)(v1 ^ v2);
+            if (vd != 0) {
+                return (size_t)(p1s - p1 + (LZAV_COND_EC(vd & 0xFF00, vd & 0x00FF) == 0));
+            }
+            p1 -= 2;
+            p2 -= 2;
+        }
+        if (p1 + 1 > p1e && p1[-1] != p2[-1]) {
+            return (size_t)(p1s - p1);
+        }
+    }
+    return ml;
+#endif
 }
+
 
 /**
  * @brief Internal LZAV block header writing function (stream format 2).
@@ -890,6 +942,19 @@ LZAV_INLINE_F int lzav_compress_bound_hi( const int srcl ) LZAV_NOEX
 LZAV_INLINE_F void lzav_ht_init( uint8_t* const ht, const size_t htsize,
 	const uint32_t* const initv ) LZAV_NOEX
 {
+#ifdef LZAV_USE_RVV
+    size_t vlmax = LZAV_VLEN_MAX;
+    vuint8m1_t v_init = LZAV_VLOAD8(ht, 8);  // 加载初始8字节
+    uint8_t* htc = ht + 8;
+    while (htc < ht + htsize) {
+        size_t vl = LZAV_VSETVL(MIN(ht + htsize - htc, vlmax * 8));  // 批量
+        // Replicate pattern 用 vslideup
+        for (size_t i = 0; i < vl / 8; i++) {
+            LZAV_VSTORE8(htc + i * 8, v_init, 8);
+        }
+        htc += vl;
+    }
+#else
 	memcpy( ht, initv, 8 );
 	memcpy( ht + 8, initv, 8 );
 	memcpy( ht + 16, ht, 16 );
@@ -907,6 +972,7 @@ LZAV_INLINE_F void lzav_ht_init( uint8_t* const ht, const size_t htsize,
 		memcpy( htc + 48, ht, 16 );
 		htc += 64;
 	}
+#endif
 }
 
 /**
